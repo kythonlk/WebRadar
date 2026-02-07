@@ -1,0 +1,13 @@
+admin
+wp-admin
+admin
+admin123
+admin1234
+admin12345
+admin123456
+admin1234567
+admin12345678
+admin123456789
+login
+admin-login
+index.php
