@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/kythonlk/WebRadar/modals/output"
 	"github.com/kythonlk/WebRadar/modals/recon"
 )
 
@@ -57,7 +57,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.status = "Scanning... (this may take 30–120 seconds)"
-			return m, tea.Batch(scanCmd(m.domain))
+			return m, tea.Batch(scanCmd(m.domain, "wordlist.txt"))
 
 		default:
 			if len(msg.String()) == 1 && msg.Type == tea.KeyRunes {
@@ -84,45 +84,86 @@ type scanFinishedMsg struct {
 	err    error
 }
 
-func scanCmd(domain string) tea.Cmd {
+func scanCmd(domain string, wordlistPath string) tea.Cmd {
 	return func() tea.Msg {
+		var errs []string
+
 		base := "https://" + domain
-		if _, err := http.Get(base); err != nil {
+		client := &http.Client{Timeout: 8 * time.Second}
+		resp, err := client.Get(base)
+		if err != nil || resp.StatusCode >= 400 {
 			base = "http://" + domain
+			errs = append(errs, fmt.Sprintf("HTTPS failed, falling back to HTTP: %v", err))
+		}
+		if resp != nil {
+			resp.Body.Close()
 		}
 
 		res := recon.ScanResult{
 			Domain: domain,
+			Errors: []string{},
 		}
 
+		// IP
 		ip, err := recon.ResolveIP(domain)
 		if err == nil {
 			res.IP = ip
 		} else {
-			res.Errors = append(res.Errors, err.Error())
+			errs = append(errs, fmt.Sprintf("IP resolution failed: %v", err))
 		}
 
-		res.SitemapPages = recon.FetchSitemap(base)
-
-		if len(res.SitemapPages) > 0 {
-			res.SitemapPages = append([]string{
-				fmt.Sprintf("// %d URLs discovered in sitemap.xml", len(res.SitemapPages)),
-			}, res.SitemapPages...)
-		} else {
-			res.Errors = append(res.Errors, "No sitemap.xml found or empty")
-		}
-
+		// Technologies
 		res.Technologies = recon.DetectTech(base)
-		res.OpenPorts = recon.ScanPorts(domain, nil, 2*time.Second)
-		res.WHOIS = recon.GetWHOIS(domain)
-		res.RobotsTXT = recon.FetchRobotsTXT(base)
-		res.SitemapURLs = recon.FetchSitemap(base)
-		res.HiddenPaths = recon.DirBrute(base, "wordlist.txt", 12)
 
-		// Save json
-		data, _ := json.MarshalIndent(res, "", "  ")
-		fname := fmt.Sprintf("scan_%s.json", strings.ReplaceAll(domain, ".", "_"))
-		os.WriteFile(fname, data, 0644)
+		// Ports
+		res.OpenPorts = recon.ScanPorts(domain, nil, 2*time.Second)
+
+		// WHOIS
+		whoisRaw := recon.GetWHOIS(domain)
+		whoisMap := make(map[string]interface{}, len(whoisRaw))
+		for k, v := range whoisRaw {
+			whoisMap[k] = v
+		}
+		res.WHOIS = whoisMap
+
+		// Robots.txt
+		res.RobotsTXT = recon.FetchRobotsTXT(base)
+
+		sitemapURLs := recon.FetchSitemap(base)
+		if len(sitemapURLs) > 0 {
+			res.SitemapPages = append([]string{
+				fmt.Sprintf("// %d URLs discovered in sitemap.xml", len(sitemapURLs)),
+			}, sitemapURLs...)
+		} else {
+			errs = append(errs, "No sitemap.xml found or empty")
+		}
+
+		// dir brute-force
+		if wordlistPath == "" {
+			wordlistPath = "wordlist.txt"
+		}
+		if _, err := os.Stat(wordlistPath); os.IsNotExist(err) {
+			errs = append(errs, fmt.Sprintf("Wordlist not found: %s", wordlistPath))
+		} else {
+			res.HiddenPaths = recon.DirBrute(base, wordlistPath, 12)
+		}
+
+		res.Errors = append(res.Errors, errs...)
+
+		jsonPath, err := output.SaveResultsToJSON(res)
+		if err != nil {
+			res.Errors = append(res.Errors, fmt.Sprintf("Failed to save JSON: %v", err))
+		}
+
+		if jsonPath != "" {
+			htmlPath, htmlErr := output.GenerateAndOpenHTMLForScan(res, jsonPath)
+			if htmlErr == nil {
+				fmt.Fprintf(os.Stderr, "HTML report opened: %s\n", htmlPath)
+			} else {
+				fmt.Fprintf(os.Stderr, "HTML generation failed: %v\n", htmlErr)
+				res.Errors = append(res.Errors, fmt.Sprintf("HTML generation failed: %v", htmlErr))
+			}
+		}
 
 		return scanFinishedMsg{result: res, err: nil}
 	}
@@ -159,8 +200,8 @@ func (m model) View() string {
 
 	var s strings.Builder
 
-	s.WriteString(titleStyle.Render(" WebRadar • Domain Recon ") + "\n")
-	s.WriteString(strings.Repeat("─", 48) + "\n\n")
+	s.WriteString(titleStyle.Render(" WebRadar -- Domain Recon ") + "\n")
+	s.WriteString(strings.Repeat("-", 48) + "\n\n")
 
 	if !m.done {
 		domainLine := fmt.Sprintf("Domain: %s", m.domain)
@@ -168,10 +209,10 @@ func (m model) View() string {
 			domainLine = dimStyle.Render("Domain: [type domain and press Enter]")
 		}
 
-		s.WriteString(subtitleStyle.Render("► TARGET") + "\n")
+		s.WriteString(subtitleStyle.Render("> TARGET") + "\n")
 		s.WriteString(boxStyle.Render(domainLine) + "\n\n")
 
-		s.WriteString(subtitleStyle.Render("► STATUS") + "\n")
+		s.WriteString(subtitleStyle.Render("> STATUS") + "\n")
 		statusText := m.status
 		if statusText == "" {
 			statusText = "Ready to scan"
@@ -182,8 +223,8 @@ func (m model) View() string {
 			s.WriteString(errorStyle.Render("Error: "+m.err.Error()) + "\n\n")
 		}
 
-		s.WriteString(dimStyle.Render("  • Press Enter → Start scan") + "\n")
-		s.WriteString(dimStyle.Render("  • Esc / Ctrl+C → Quit") + "\n")
+		s.WriteString(dimStyle.Render("  • Press Enter -> Start scan") + "\n")
+		s.WriteString(dimStyle.Render("  • Esc / Ctrl+C -> Quit") + "\n")
 	} else {
 		s.WriteString(successStyle.Render("✓ Scan completed") + "\n\n")
 
@@ -191,7 +232,6 @@ func (m model) View() string {
 			boxStyle.Copy().
 				BorderForeground(lipgloss.Color("39")).
 				Render(fmt.Sprintf("IP\n%s", m.result.IP)),
-
 			"  ",
 
 			boxStyle.Copy().
@@ -210,7 +250,6 @@ func (m model) View() string {
 			s.WriteString(boxStyle.Render(strings.Join(techLines, "\n")) + "\n")
 		}
 
-		// Quick stats
 		stats := []string{
 			fmt.Sprintf("Hidden paths: %d", len(m.result.HiddenPaths)),
 			fmt.Sprintf("Sitemap pages: %d", len(m.result.SitemapPages)),
@@ -219,15 +258,12 @@ func (m model) View() string {
 		s.WriteString(subtitleStyle.Render("Quick Stats") + "\n")
 		s.WriteString(boxStyle.Render(strings.Join(stats, "\n")) + "\n\n")
 
-		// File info
 		filename := fmt.Sprintf("scan_%s.json", strings.ReplaceAll(m.result.Domain, ".", "_"))
-		s.WriteString(successStyle.Render("→ Results saved to: ") + filename + "\n\n")
+		s.WriteString(successStyle.Render("-> Results saved to: ") + filename + "\n\n")
 
-		// Footer / controls
 		s.WriteString(dimStyle.Render("  Press q / Esc / Ctrl+C to quit") + "\n")
 	}
 
-	// Final margin + render
 	content := s.String()
 	return lipgloss.NewStyle().
 		Margin(1, 2, 1, 2).
